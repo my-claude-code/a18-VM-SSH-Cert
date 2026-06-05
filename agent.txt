@@ -1,0 +1,118 @@
+PLAN FOR a19 — Azure AI Foundry Agent to run VM scripts
+=========================================================
+
+WHAT WE WANT TO ACHIEVE
+------------------------
+We have a VM (a18-vm) with 3 scripts in /home/ivansto/scripts/:
+  - user.sh   — creates a random user on the VM
+  - file.sh   — creates a random file in /home/ivansto/scripts/
+  - folder.sh — creates a random folder in /home/ivansto/scripts/
+
+We want to send an HTTP request with a natural language message
+(e.g. "create a new user" or "make a file") and have an AI agent
+figure out which script to run, execute it on the VM, and return
+the output back to us.
+
+
+ARCHITECTURE
+------------
+
+  HTTP request ("create a new user")
+          |
+          v
+  Azure Function (HTTP trigger)        <-- this is the entry point you call
+          |
+          v
+  Azure AI Foundry Agent (GPT-4o)      <-- interprets the message
+          |
+          v
+  Tool call: run_script(name)          <-- agent decides which script
+          |
+          v
+  Azure Run Command API                <-- executes the script on the VM
+  (no SSH needed — Azure runs it       <-- directly via Azure infrastructure
+   directly on the VM)
+          |
+          v
+  Output returned back to you
+
+
+COMPONENTS WE WILL BUILD
+-------------------------
+1. Azure AI Foundry Hub
+   - The container for everything AI-related
+
+2. Azure AI Foundry Project
+   - Lives inside the Hub
+   - Where the agent is defined
+
+3. GPT-4o model deployment (pay-as-you-go)
+   - The brain of the agent
+   - Costs ~$0.001 per call
+
+4. AI Foundry Agent
+   - Has a system prompt that knows about the 3 scripts
+   - Has one tool: run_script(script_name)
+   - Receives your message, picks the right script, calls the tool
+
+5. Azure Function (Python, HTTP trigger)
+   - This is what you call via HTTP
+   - It sends your message to the agent
+   - The agent calls the run_script tool
+   - The function executes the script on the VM via Azure Run Command
+   - Returns the output to you
+
+6. Azure Run Command
+   - Built-in Azure feature to run shell scripts on VMs
+   - No SSH, no keys needed
+   - Free to use
+
+
+HOW YOU WILL USE IT
+--------------------
+Send an HTTP request like this:
+
+  curl "https://<function-url>/api/run-agent?code=<key>" \
+       -X POST \
+       -H "Content-Type: application/json" \
+       -d '{"message": "create a new random user on the server"}'
+
+The agent will:
+  1. Read your message
+  2. Decide it should run user.sh
+  3. Call the run_script tool with "user.sh"
+  4. Azure Run Command executes user.sh on a18-vm
+  5. You get back something like: {"output": "Created user: user4f2a9c1b"}
+
+
+WHAT TERRAFORM WILL CREATE
+----------------------------
+- Resource group for AI resources
+- Azure AI Foundry Hub
+- Azure AI Foundry Project
+- GPT-4o model deployment
+- Storage Account (required by Foundry)
+- Azure Function App (Consumption plan, Python)
+- Managed identity with:
+    - Contributor on a18-vm resource group (to run Azure Run Command)
+    - Cognitive Services OpenAI User on the AI Foundry project (to call the agent)
+
+
+COST
+-----
+- GPT-4o:         ~$0.001 per call (pay-as-you-go, only pay when used)
+- Azure Function: free (Consumption plan, 1M calls/month free)
+- Run Command:    free
+- Foundry Hub:    free
+- Storage:        ~$0.02/GB/month (negligible)
+Total:            essentially $0 for occasional use
+
+
+CLEANUP AFTER USE (terraform destroy)
+--------------------------------------
+terraform destroy removes everything except one thing:
+Azure AI Foundry creates a Key Vault in soft-delete state (90-day retention).
+You must manually purge it or it blocks future deployments with the same name:
+
+  az keyvault list-deleted --query "[].name" -o table
+  az keyvault purge --name <vault-name>
